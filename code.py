@@ -164,7 +164,7 @@ with st.container(border=True):
         
         st.text_input(
             "Jumlah saldo saat penarikan", 
-            placeholder="5,000,000",
+            placeholder="0",
             key='initial_balance_str', 
             on_change=lambda: _format_input_callback('initial_balance_str'),
             help="Masukkan saldo awal sebelum penarikan dilakukan"
@@ -179,7 +179,7 @@ with st.container(border=True):
         st.text_input(
             "Nominal dana ditarik (aktual)", 
             key='extracted_amount_str', 
-            placeholder="5,000,000",
+            placeholder="0",
             on_change=lambda: _format_input_callback('extracted_amount_str'),
             help="Masukkan nominal dana yang sebenarnya masuk ke rekening bank"
         )
@@ -913,227 +913,238 @@ def format_final_consolidation(df, platform_selected):
 
 # --- EXECUTION LOGIC ---
 # --- UPDATE EXECUTION LOGIC SECTION (Replace the entire "if uploaded_file:" block) ---
-if uploaded_file:
-    run = st.button("Run Processing")
-    if run:
-        with st.spinner('Sedang memproses data... Mohon tunggu ⏳'):
-            # 1. BACA FILE UTAMA (VALID)
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file, sep=None, engine='python', encoding='windows-1252')
+
+# 1. Tentukan kondisi kelengkapan data (Syarat tombol aktif)
+# Tombol aktif jika: File Utama diunggah DAN Saldo Awal > 0 DAN Dana Ditarik > 0
+ready_to_process = (uploaded_file is not None) and (initial_balance > 0) and (extracted_amount > 0)
+
+# 2. Tampilkan pesan instruksi jika data belum lengkap
+
+# 3. Tombol diletakkan di luar blok 'if uploaded_file' agar selalu muncul
+run = st.button(
+    "Run Processing", 
+    disabled=not ready_to_process,  # Tombol akan 'greyed out' jika belum ready
+    help="Pastikan semua data telah diunggah dan nilai saldo awal serta dana ditarik telah diisi dengan benar.")
+
+if run:
+    with st.spinner('Sedang memproses data... Mohon tunggu ⏳'):
+        # 1. BACA FILE UTAMA (VALID)
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file, sep=None, engine='python', encoding='windows-1252')
+        else:
+            df = pd.read_excel(uploaded_file)
+
+        df.columns = df.columns.str.lower()
+        df.dropna(how='all', inplace=True)
+        df.fillna(0, inplace=True)
+        df.columns = df.columns.str.replace(' ', '_', regex=False).str.rstrip('_')
+
+        sum_df = None
+        escrow_balance_table = None
+        invalid_df = None
+
+        # --- PROSES E-COMMERCE (VALID) ---
+        if platform == "Tiktok Shop":
+            if check_required_columns(df, TIKTOK_REQUIRED, platform):
+                sum_df, escrow_balance_table = process_tiktok_shop(df, withdraw_date, initial_balance, extracted_amount)
+        elif platform == "Shopee":
+            if check_required_columns(df, SHOPEE_REQUIRED, platform):
+                sum_df, escrow_balance_table = process_shopee(df, withdraw_date, initial_balance, extracted_amount)
+        elif platform == "Lazada":
+            if check_required_columns(df, LAZADA_REQUIRED, platform):
+                sum_df, escrow_balance_table = process_lazada(df, withdraw_date, initial_balance, extracted_amount)
+
+        # --- PROSES FILE INVALID (OPTIONAL) ---
+        if uploaded_file_invalid is not None:
+            if uploaded_file_invalid.name.endswith('.csv'):
+                df_inv_raw = pd.read_csv(uploaded_file_invalid, sep=None, engine='python', encoding='windows-1252')
             else:
-                df = pd.read_excel(uploaded_file)
+                df_inv_raw = pd.read_excel(uploaded_file_invalid)
 
-            df.columns = df.columns.str.lower()
-            df.dropna(how='all', inplace=True)
-            df.fillna(0, inplace=True)
-            df.columns = df.columns.str.replace(' ', '_', regex=False).str.rstrip('_')
+            df_inv_raw.columns = df_inv_raw.columns.str.lower()
+            df_inv_raw.dropna(how='all', inplace=True)
+            df_inv_raw.fillna(0, inplace=True)
+            df_inv_raw.columns = df_inv_raw.columns.str.replace(' ', '_', regex=False).str.rstrip('_')
 
-            sum_df = None
-            escrow_balance_table = None
-            invalid_df = None
-
-            # --- PROSES E-COMMERCE (VALID) ---
             if platform == "Tiktok Shop":
-                if check_required_columns(df, TIKTOK_REQUIRED, platform):
-                    sum_df, escrow_balance_table = process_tiktok_shop(df, withdraw_date, initial_balance, extracted_amount)
+                invalid_df = process_tiktok_invalid(df_inv_raw, withdraw_date, initial_balance, extracted_amount)
             elif platform == "Shopee":
-                if check_required_columns(df, SHOPEE_REQUIRED, platform):
-                    sum_df, escrow_balance_table = process_shopee(df, withdraw_date, initial_balance, extracted_amount)
+                invalid_df = process_shopee_invalid(df_inv_raw, withdraw_date, initial_balance, extracted_amount)
             elif platform == "Lazada":
-                if check_required_columns(df, LAZADA_REQUIRED, platform):
-                    sum_df, escrow_balance_table = process_lazada(df, withdraw_date, initial_balance, extracted_amount)
+                invalid_df = process_lazada_invalid(df_inv_raw, withdraw_date, initial_balance, extracted_amount)
 
-            # --- PROSES FILE INVALID (OPTIONAL) ---
-            if uploaded_file_invalid is not None:
-                if uploaded_file_invalid.name.endswith('.csv'):
-                    df_inv_raw = pd.read_csv(uploaded_file_invalid, sep=None, engine='python', encoding='windows-1252')
-                else:
-                    df_inv_raw = pd.read_excel(uploaded_file_invalid)
+        # --- 2. GABUNGKAN INVALID KE SUMMARY (SINKRONISASI TOTAL) ---
+        if sum_df is not None and invalid_df is not None:
+            # Ambil data valid saja (buang baris TOTAL jika ada)
+            base_valid = sum_df[sum_df['settlement_id'] != 'TOTAL'].copy()
+            
+            # Samakan kolom invalid agar bisa di-concat
+            for c in base_valid.columns:
+                if c not in invalid_df.columns:
+                    if c in base_valid.select_dtypes(include=[np.number]).columns:
+                        invalid_df[c] = 0
+                    else:
+                        invalid_df[c] = np.nan
+            
+            # Gabungkan data asli
+            combined_ecom = pd.concat([base_valid, invalid_df[base_valid.columns]], ignore_index=True)
 
-                df_inv_raw.columns = df_inv_raw.columns.str.lower()
-                df_inv_raw.dropna(how='all', inplace=True)
-                df_inv_raw.fillna(0, inplace=True)
-                df_inv_raw.columns = df_inv_raw.columns.str.replace(' ', '_', regex=False).str.rstrip('_')
+            # Hitung ulang baris TOTAL untuk tampilan Summary
+            numeric_cols = combined_ecom.select_dtypes(include=[np.number]).columns
+            total_row_mod = {col: combined_ecom[col].sum() if col in numeric_cols else ' ' for col in combined_ecom.columns}
+            if 'settlement_id' in combined_ecom.columns: 
+                total_row_mod['settlement_id'] = 'TOTAL'
+            
+            sum_df = pd.concat([combined_ecom, pd.DataFrame([total_row_mod])], ignore_index=True)
 
-                if platform == "Tiktok Shop":
-                    invalid_df = process_tiktok_invalid(df_inv_raw, withdraw_date, initial_balance, extracted_amount)
-                elif platform == "Shopee":
-                    invalid_df = process_shopee_invalid(df_inv_raw, withdraw_date, initial_balance, extracted_amount)
-                elif platform == "Lazada":
-                    invalid_df = process_lazada_invalid(df_inv_raw, withdraw_date, initial_balance, extracted_amount)
+            # Update tabel Escrow Balance dengan total baru yang sudah digabung
+            total_escrow_new = int(combined_ecom['escrow_amount'].sum())
+            escrow_actual = int(extracted_amount)
+            escrow_balance_table = pd.DataFrame({
+                'Keterangan': ['Jumlah saldo saat penarikan', 'Nominal dana ditarik (invoice)', 'Nominal dana ditarik (aktual)', 'Sisa saldo setelah ditarik'],
+                'Nominal': [initial_balance, total_escrow_new, escrow_actual, initial_balance - escrow_actual]
+            })
 
-            # --- 2. GABUNGKAN INVALID KE SUMMARY (SINKRONISASI TOTAL) ---
-            if sum_df is not None and invalid_df is not None:
-                # Ambil data valid saja (buang baris TOTAL jika ada)
-                base_valid = sum_df[sum_df['settlement_id'] != 'TOTAL'].copy()
-                
-                # Samakan kolom invalid agar bisa di-concat
-                for c in base_valid.columns:
-                    if c not in invalid_df.columns:
-                        if c in base_valid.select_dtypes(include=[np.number]).columns:
-                            invalid_df[c] = 0
-                        else:
-                            invalid_df[c] = np.nan
-                
-                # Gabungkan data asli
-                combined_ecom = pd.concat([base_valid, invalid_df[base_valid.columns]], ignore_index=True)
-
-                # Hitung ulang baris TOTAL untuk tampilan Summary
-                numeric_cols = combined_ecom.select_dtypes(include=[np.number]).columns
-                total_row_mod = {col: combined_ecom[col].sum() if col in numeric_cols else ' ' for col in combined_ecom.columns}
-                if 'settlement_id' in combined_ecom.columns: 
-                    total_row_mod['settlement_id'] = 'TOTAL'
-                
-                sum_df = pd.concat([combined_ecom, pd.DataFrame([total_row_mod])], ignore_index=True)
-
-                # Update tabel Escrow Balance dengan total baru yang sudah digabung
-                total_escrow_new = int(combined_ecom['escrow_amount'].sum())
-                escrow_actual = int(extracted_amount)
-                escrow_balance_table = pd.DataFrame({
-                    'Keterangan': ['Jumlah saldo saat penarikan', 'Nominal dana ditarik (invoice)', 'Nominal dana ditarik (aktual)', 'Sisa saldo setelah ditarik'],
-                    'Nominal': [initial_balance, total_escrow_new, escrow_actual, initial_balance - escrow_actual]
-                })
-
-            # --- 3. PROSES DATA LAINNYA & KONSOLIDASI JURNAL ---
-            df_lainnya_clean = None
-            if uploaded_file_lainnya is not None:
-                if uploaded_file_lainnya.name.endswith('.csv'):
-                    df_lain_raw = pd.read_csv(uploaded_file_lainnya, sep=None, engine='python', encoding='windows-1252')
-                else:
-                    df_lain_raw = pd.read_excel(uploaded_file_lainnya)
-                
-                df_lainnya_clean, err = process_lainnya(df_lain_raw)
-                if err: 
-                    st.error(err)
-
-            # PEMBUATAN TABEL JURNAL (Hanya 1 jalur proses agar tidak double input)
-            final_lainnya_df = None
-            if sum_df is not None:
-                # Gunakan sum_df yang sudah digabung dengan invalid di atas
-                # Fungsi merge_ecommerce_to_lainnya sudah memfilter baris 'TOTAL' di dalamnya
-                merged_for_journal = merge_ecommerce_to_lainnya(df_lainnya_clean, sum_df)
-                
-                # Terapkan format standar SAP
-                formatted_journal = format_final_consolidation(merged_for_journal, platform)
-                
-                # Tambahkan baris TOTAL di paling bawah
-                final_lainnya_df = add_total_row(formatted_journal)
-            elif df_lainnya_clean is not None:
-                # Jika hanya ada data expense lainnya tanpa e-commerce
-                formatted_journal = format_final_consolidation(df_lainnya_clean, platform)
-                final_lainnya_df = add_total_row(formatted_journal)
-        # ---------------------------------------------------------
-        # 4. DISPLAY
-        # ---------------------------------------------------------
-        def highlight_no_match(row):
-            # Cek basis tema yang dikonfigurasi (light atau dark)
-            theme_base = st.get_option("theme.base")
-            if theme_base == "dark":
-                # Merah gelap untuk tema dark
-                color = "#4d0000"
+        # --- 3. PROSES DATA LAINNYA & KONSOLIDASI JURNAL ---
+        df_lainnya_clean = None
+        if uploaded_file_lainnya is not None:
+            if uploaded_file_lainnya.name.endswith('.csv'):
+                df_lain_raw = pd.read_csv(uploaded_file_lainnya, sep=None, engine='python', encoding='windows-1252')
             else:
-                # Merah muda untuk tema light
-                color = "#ffcccc"
-            if 'warehouse_name' in row.index and 'No Match Found' in str(row['warehouse_name']):
-                return [f'background-color: {color}'] * len(row)
-            return [''] * len(row)
+                df_lain_raw = pd.read_excel(uploaded_file_lainnya)
+            
+            df_lainnya_clean, err = process_lainnya(df_lain_raw)
+            if err: 
+                st.error(err)
 
-
+        # PEMBUATAN TABEL JURNAL (Hanya 1 jalur proses agar tidak double input)
+        final_lainnya_df = None
         if sum_df is not None:
-            st.markdown(f"### Summary of {platform} Settlement on {withdraw_date}")
+            # Gunakan sum_df yang sudah digabung dengan invalid di atas
+            # Fungsi merge_ecommerce_to_lainnya sudah memfilter baris 'TOTAL' di dalamnya
+            merged_for_journal = merge_ecommerce_to_lainnya(df_lainnya_clean, sum_df)
             
-            # --- A. LOGIKA NOTICE (Terpusat) ---
-            if 'warehouse_name' in sum_df.columns:
-                has_no_match = sum_df['warehouse_name'].astype(str).str.contains('No Match Found', case=False).any()
-                if has_no_match:
-                    st.warning("⚠️ **Peringatan:** Terdeteksi data dengan **'No Match Found'** pada kolom Warehouse Name. Mohon periksa kembali atau hubungi pihak terkait.")
+            # Terapkan format standar SAP
+            formatted_journal = format_final_consolidation(merged_for_journal, platform)
+            
+            # Tambahkan baris TOTAL di paling bawah
+            final_lainnya_df = add_total_row(formatted_journal)
+        elif df_lainnya_clean is not None:
+            # Jika hanya ada data expense lainnya tanpa e-commerce
+            formatted_journal = format_final_consolidation(df_lainnya_clean, platform)
+            final_lainnya_df = add_total_row(formatted_journal)
+    # ---------------------------------------------------------
+    # 4. DISPLAY
+    # ---------------------------------------------------------
+    def highlight_no_match(row):
+        # Cek basis tema yang dikonfigurasi (light atau dark)
+        theme_base = st.get_option("theme.base")
+        if theme_base == "dark":
+            # Merah gelap untuk tema dark
+            color = "#4d0000"
+        else:
+            # Merah muda untuk tema light
+            color = "#ffcccc"
+        if 'warehouse_name' in row.index and 'No Match Found' in str(row['warehouse_name']):
+            return [f'background-color: {color}'] * len(row)
+        return [''] * len(row)
 
-            # --- B. LOGIKA STYLING (Highlight & Format Angka) ---
-            cols_to_format = ['sales', 'invoice', 'total_discount', 'shipping_fee', 'marketing_fee', 'admin_fee', 'affiliate_commission_fee', 'escrow_amount']
-            valid_cols = [c for c in cols_to_format if c in sum_df.columns]
-            
-            # Menggabungkan highlight baris dan format ribuan
-            styled_df = (sum_df.style
-                         .apply(highlight_no_match, axis=1)
-                         .format({col: "{:,.0f}" for col in valid_cols}))
-            
-            st.dataframe(styled_df,
-                         use_container_width=True)
 
-            if escrow_balance_table is not None:
-                st.markdown("### Escrow Balance")
-                st.dataframe(escrow_balance_table.style.format({"Nominal": "{:,.0f}"}))
+    if sum_df is not None:
+        st.markdown(f"### Summary of {platform} Settlement on {withdraw_date}")
         
-        if final_lainnya_df is not None:
-            st.divider()
-            st.markdown("### Consolidated Data (SAP Format)")
-            target_col = "Amount in Functional Currency"
-            column_configuration = {
-                "Billing No": st.column_config.TextColumn("Billing No", width="medium"),
-                "Clearing Date": st.column_config.DateColumn("Clearing Date", width="medium"),
-                "Reason Code": st.column_config.TextColumn("Reason Code", width="small"),
-            }
-            if target_col in final_lainnya_df.columns:
-                st.dataframe(
-                    final_lainnya_df.style.format({target_col: "{:,.0f}"}, na_rep="-"),
-                    use_container_width=True,
-                    column_config=column_configuration
-                )
-            else:
-                st.dataframe(
-                    final_lainnya_df,
-                    use_container_width=True,
-                    column_config=column_configuration
-                )
+        # --- A. LOGIKA NOTICE (Terpusat) ---
+        if 'warehouse_name' in sum_df.columns:
+            has_no_match = sum_df['warehouse_name'].astype(str).str.contains('No Match Found', case=False).any()
+            if has_no_match:
+                st.warning("⚠️ **Peringatan:** Terdeteksi data dengan **'No Match Found'** pada kolom Warehouse Name. Mohon periksa kembali atau hubungi pihak terkait.")
 
-        # ---------------------------------------------------------
-        # 5. DOWNLOAD
-        # ---------------------------------------------------------
-        if sum_df is not None or final_lainnya_df is not None:
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                if sum_df is not None:
-                    sum_df.to_excel(writer, index=False, sheet_name='ProcessedData')
-                if escrow_balance_table is not None:
-                    escrow_balance_table.to_excel(writer, index=False, sheet_name='Escrow_Balance')
-                if invalid_df is not None:
-                    invalid_df.to_excel(writer, index=False, sheet_name='Invalid_Data')
-                if final_lainnya_df is not None:
-                    final_lainnya_df.to_excel(writer, index=False, sheet_name='Journal_Upload')
+        # --- B. LOGIKA STYLING (Highlight & Format Angka) ---
+        cols_to_format = ['sales', 'invoice', 'total_discount', 'shipping_fee', 'marketing_fee', 'admin_fee', 'affiliate_commission_fee', 'escrow_amount']
+        valid_cols = [c for c in cols_to_format if c in sum_df.columns]
+        
+        # Menggabungkan highlight baris dan format ribuan
+        styled_df = (sum_df.style
+                        .apply(highlight_no_match, axis=1)
+                        .format({col: "{:,.0f}" for col in valid_cols}))
+        
+        st.dataframe(styled_df,
+                        use_container_width=True)
 
-                workbook = writer.book
-                int_fmt = workbook.add_format({'num_format': '#,##0'})
-                
-                if sum_df is not None:
-                    ws = writer.sheets['ProcessedData']
-                    for col in sum_df.select_dtypes(include=[np.number]).columns:
-                        try: ws.set_column(sum_df.columns.get_loc(col), sum_df.columns.get_loc(col), 20, int_fmt)
-                        except: pass
-                
-                if escrow_balance_table is not None:
-                    ws = writer.sheets['Escrow_Balance']
-                    try: ws.set_column(escrow_balance_table.columns.get_loc("Nominal"), escrow_balance_table.columns.get_loc("Nominal"), 20, int_fmt)
+        if escrow_balance_table is not None:
+            st.markdown("### Escrow Balance")
+            st.dataframe(escrow_balance_table.style.format({"Nominal": "{:,.0f}"}))
+    
+    if final_lainnya_df is not None:
+        st.divider()
+        st.markdown("### Consolidated Data (SAP Format)")
+        target_col = "Amount in Functional Currency"
+        column_configuration = {
+            "Billing No": st.column_config.TextColumn("Billing No", width="medium"),
+            "Clearing Date": st.column_config.DateColumn("Clearing Date", width="medium"),
+            "Reason Code": st.column_config.TextColumn("Reason Code", width="small"),
+        }
+        if target_col in final_lainnya_df.columns:
+            st.dataframe(
+                final_lainnya_df.style.format({target_col: "{:,.0f}"}, na_rep="-"),
+                use_container_width=True,
+                column_config=column_configuration
+            )
+        else:
+            st.dataframe(
+                final_lainnya_df,
+                use_container_width=True,
+                column_config=column_configuration
+            )
+
+    # ---------------------------------------------------------
+    # 5. DOWNLOAD
+    # ---------------------------------------------------------
+    if sum_df is not None or final_lainnya_df is not None:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            if sum_df is not None:
+                sum_df.to_excel(writer, index=False, sheet_name='ProcessedData')
+            if escrow_balance_table is not None:
+                escrow_balance_table.to_excel(writer, index=False, sheet_name='Escrow_Balance')
+            if invalid_df is not None:
+                invalid_df.to_excel(writer, index=False, sheet_name='Invalid_Data')
+            if final_lainnya_df is not None:
+                final_lainnya_df.to_excel(writer, index=False, sheet_name='Journal_Upload')
+
+            workbook = writer.book
+            int_fmt = workbook.add_format({'num_format': '#,##0'})
+            
+            if sum_df is not None:
+                ws = writer.sheets['ProcessedData']
+                for col in sum_df.select_dtypes(include=[np.number]).columns:
+                    try: ws.set_column(sum_df.columns.get_loc(col), sum_df.columns.get_loc(col), 20, int_fmt)
+                    except: pass
+            
+            if escrow_balance_table is not None:
+                ws = writer.sheets['Escrow_Balance']
+                try: ws.set_column(escrow_balance_table.columns.get_loc("Nominal"), escrow_balance_table.columns.get_loc("Nominal"), 20, int_fmt)
+                except: pass
+
+            if invalid_df is not None:
+                ws = writer.sheets['Invalid_Data']
+                for col in invalid_df.select_dtypes(include=[np.number]).columns:
+                    try: ws.set_column(invalid_df.columns.get_loc(col), invalid_df.columns.get_loc(col), 20, int_fmt)
                     except: pass
 
-                if invalid_df is not None:
-                    ws = writer.sheets['Invalid_Data']
-                    for col in invalid_df.select_dtypes(include=[np.number]).columns:
-                        try: ws.set_column(invalid_df.columns.get_loc(col), invalid_df.columns.get_loc(col), 20, int_fmt)
-                        except: pass
+            if final_lainnya_df is not None:
+                ws = writer.sheets['Journal_Upload']
+                if "Amount in Functional Currency" in final_lainnya_df.columns:
+                    try: 
+                        idx = final_lainnya_df.columns.get_loc("Amount in Functional Currency")
+                        ws.set_column(idx, idx, 20, int_fmt)
+                    except: pass
 
-                if final_lainnya_df is not None:
-                    ws = writer.sheets['Journal_Upload']
-                    if "Amount in Functional Currency" in final_lainnya_df.columns:
-                        try: 
-                            idx = final_lainnya_df.columns.get_loc("Amount in Functional Currency")
-                            ws.set_column(idx, idx, 20, int_fmt)
-                        except: pass
-
-            output.seek(0)
-            file_name = f"Summary_{platform}_{withdraw_date.strftime('%d%m%y')}.xlsx"
-            st.download_button(
-                label="Download All Processed Data (Excel)",
-                data=output,
-                file_name=file_name,
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
+        output.seek(0)
+        file_name = f"Summary_{platform}_{withdraw_date.strftime('%d%m%y')}.xlsx"
+        st.download_button(
+            label="Download All Processed Data (Excel)",
+            data=output,
+            file_name=file_name,
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
